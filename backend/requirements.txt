@@ -1,0 +1,20 @@
+# Recommended updates for your requirements.txt
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.1
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-experimental
+langchain-text-splitters>=0.3.0
+neo4j>=5.20.0  # 6.1.0 doesn't exist yet either, 5.x is the current official driver
+python-dotenv>=1.0.1
+pydantic>=2.9.0
+tiktoken>=0.7.0
+sse-starlette>=2.0.0
+beautifulsoup4>=4.12.3
+wikipedia-api>=0.7.1
+pypdf>=4.2.0
+neo4j-graphrag>=1.0.0 # Added here so you can remove it from the Dockerfile RUN command
+nest_asyncio>=1.6.0  # Required for asyncio.gather() inside FastAPI's running event loop
+pymupdf4llm>=0.0.17  # PDF → structured Markdown, preserves headers/tables/captions
