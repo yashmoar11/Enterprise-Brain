@@ -2,5 +2,10 @@ neo4j_data/
 neo4j_plugins/
 backend/venv/
 backend/__pycache__/
+backend/.env
+backend/data/
+frontend/node_modules/
 .venv/
 .env
+**/__pycache__/
+**/*.pyc
