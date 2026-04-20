@@ -16,7 +16,7 @@ NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL",   "gemini-2.5-pro")
+GEMINI_MODEL   = os.getenv("GEMINI_ENTITY_MODEL", "gemini-2.5-pro")  # separate from generation model
 
 # --- Domain Schemas ---
 DOMAIN_SCHEMAS = {
@@ -150,6 +150,15 @@ def ingest_document(file_path: str, dataset_id: str = "default", domain: str = "
     embedding_batch = 500
     embedding_sleep = 2
 
+    # Pre-create the named vector index BEFORE calling from_documents().
+    # Without this, LangChain detects any existing Chunk index and reuses it
+    # (e.g. vector_index_book), ignoring the index_name parameter entirely.
+    graph.query(
+        f"CREATE VECTOR INDEX `{index_name}` IF NOT EXISTS "
+        f"FOR (n:Chunk) ON (n.embedding) "
+        f"OPTIONS {{indexConfig: {{`vector.dimensions`: 3072, `vector.similarity_function`: `cosine`}}}}"
+    )
+
     neo4j_vector = None
     for i in range(0, len(docs), embedding_batch):
         batch = docs[i:i + embedding_batch]
@@ -201,7 +210,7 @@ def ingest_document(file_path: str, dataset_id: str = "default", domain: str = "
 
     graph_documents = []
     batch_size = 20
-    sleep_time = 62
+    sleep_time = 62   # Gemini RPM limit — 40 calls/batch (2 per chunk) needs breathing room
 
     print(f"Processing {len(docs)} chunks in batches of {batch_size}...")
     for i in range(0, len(docs), batch_size):

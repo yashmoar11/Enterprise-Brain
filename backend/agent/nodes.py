@@ -10,7 +10,7 @@ import os
 # --- Dual-Model Configuration ---
 # Generation: Pro model — full reasoning, high quality answers
 # Grading:    Flash-Lite model — fast, cheap, binary yes/no relevance checks
-GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 GRADING_MODEL    = os.getenv("GEMINI_GRADING_MODEL", "gemini-2.5-flash-lite")
 
 generation_llm = ChatGoogleGenerativeAI(model=GENERATION_MODEL, temperature=0)
@@ -25,11 +25,15 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
 # We build one per dataset_id and cache it so repeated queries don't re-initialise.
 _retriever_cache: dict = {}
 
+SHARED_VECTOR_INDEX = "vector_index_book"  # Neo4j only allows one vector index per node+property
+
 def _get_index_name(dataset_id: str) -> str:
-    """Maps a dataset_id to the Neo4j vector index name used at ingestion time."""
-    if dataset_id == "default":
-        return "vector_index"          # backward-compatible with existing book data
-    return f"vector_index_{dataset_id}"
+    """
+    All datasets share a single vector index (Neo4j limitation: one vector index
+    per node label + property combination). Dataset isolation is enforced via
+    retrieval_query filtering by dataset_id, not by separate indexes.
+    """
+    return SHARED_VECTOR_INDEX
 
 def get_retriever(dataset_id: str):
     """
@@ -49,6 +53,14 @@ def get_retriever(dataset_id: str):
         ft_index_name = f"{index_name}_ft"
         embeddings    = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
+        # Filter retrieval to only return chunks belonging to this dataset.
+        # All datasets share the same Chunk node label so without this filter,
+        # vector search returns chunks from every dataset mixed together.
+        retrieval_query = (
+            f"WHERE node.dataset_id = '{dataset_id}' "
+            f"RETURN node.text AS text, score, node {{.source, .dataset_id}} AS metadata"
+        )
+
         try:
             # Hybrid: vector (HNSW) + full-text (BM25), merged with RRF
             neo4j_vector = Neo4jVector.from_existing_index(
@@ -58,7 +70,8 @@ def get_retriever(dataset_id: str):
                 password=NEO4J_PASSWORD,
                 index_name=index_name,
                 search_type="hybrid",
-                keyword_index_name=ft_index_name
+                keyword_index_name=ft_index_name,
+                retrieval_query=retrieval_query,
             )
             print(f"[retriever] '{dataset_id}' → hybrid (vector + BM25)")
         except Exception:
@@ -68,7 +81,8 @@ def get_retriever(dataset_id: str):
                 url=NEO4J_URI,
                 username=NEO4J_USERNAME,
                 password=NEO4J_PASSWORD,
-                index_name=index_name
+                index_name=index_name,
+                retrieval_query=retrieval_query,
             )
             print(f"[retriever] '{dataset_id}' → vector-only (no full-text index found, re-ingest to enable hybrid)")
 

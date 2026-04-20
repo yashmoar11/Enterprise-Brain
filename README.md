@@ -2,7 +2,13 @@
 
 > A production-style Graph RAG (Retrieval-Augmented Generation) system that ingests documents, extracts a semantic knowledge graph, and answers questions in real time using streamed LLM responses with live graph visualization.
 
-> **Latest:** Dual-model grading architecture (Flash for grading, Pro for generation) with parallel async document grading reduces response time from ~3 minutes to ~20 seconds.
+> **Latest:**
+> - **Multi-dataset isolation** — physically separate Neo4j vector indexes per dataset; book, research papers, and HCI papers never mix
+> - **Hybrid search (Vector + BM25)** — reciprocal rank fusion combines semantic similarity with keyword matching via paired full-text indexes
+> - **pymupdf4llm + MarkdownHeaderTextSplitter** — structure-aware PDF ingestion preserves headers, tables, and section context in every chunk
+> - **Real-time pipeline visualizer** — Retrieve → Grade → Rewrite → Generate lights up stage-by-stage during query processing
+> - **Interactive graph with glow, particles, click-to-inspect** — node detail panel, degree-based sizing, animated edge particles
+> - **Domain-specific entity schemas** — ML schema vs. Research schema controls what types of entities and relationships are extracted
 
 ---
 
@@ -72,7 +78,7 @@ A vector database treats each chunk as an isolated unit. It cannot answer "who f
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          DOCKER COMPOSE                                 │
 │                                                                         │
-│  ┌─────────────────┐    ┌──────────────────────┐    ┌───────────────┐  │
+│  ┌─────────────────┐    ┌──────────────────────┐    ┌───────────────┐   │
 │  │   NEXT.JS        │    │     FASTAPI           │    │    NEO4J      │  │
 │  │   Frontend       │    │     Backend           │    │   Database    │  │
 │  │   :3000          │◄───┤     :8000             │◄───┤   :7474/:7687 │  │
@@ -99,31 +105,34 @@ A vector database treats each chunk as an isolated unit. It cannot answer "who f
 ### Data Flow: Ingestion Phase
 
 ```
-PDF / TXT File
+PDF File (e.g., Hands-On LLM Serving, research papers)
       │
       ▼
-TextLoader / PyPDFLoader
+pymupdf4llm.to_markdown()             ← structure-aware: preserves headers, tables, figures
       │
       ▼
-RecursiveCharacterTextSplitter
-  chunk_size=1000, overlap=200
+MarkdownHeaderTextSplitter             ← splits at ## and ### boundaries (section-aware)
       │
-      ├──────────────────────────────────────┐
-      ▼                                      ▼
-Google Embeddings                   LLMGraphTransformer
-(text-embedding-004)                (Gemini 2.5 Pro)
-      │                                      │
-      ▼                                      ▼
-Neo4j Vector Index              Neo4j Knowledge Graph
-"Chunk" nodes with              Entity nodes (Person,
-embedding property              Org, Product, etc.)
-                                + Relationship edges
-      │                                      │
-      └──────────────────────────────────────┘
-                        │
-                        ▼
-              NEXT_CHUNK relationships
-              (sequential linking)
+      ▼
+RecursiveCharacterTextSplitter         ← secondary split for oversized sections
+  chunk_size=1500, overlap=200            (only if a section exceeds 1500 chars)
+      │
+      ├────────────────────────────────────────────┐
+      ▼                                            ▼
+Google Embeddings                        LLMGraphTransformer
+(gemini-embedding-001)                   (Gemini 3.1 Pro Preview + domain schema)
+      │                                            │
+      ▼                                            ▼
+Neo4j Vector Index                     Neo4j Knowledge Graph
+  vector_index_{dataset_id}            Entity nodes (Algorithm,
+  + vector_index_{dataset_id}_ft       ModelArchitecture, Author,
+  (BM25 full-text paired index)        Method, Paper, etc.)
+                                       + Relationship edges
+      │                                            │
+      └────────────────────────────────────────────┘
+                           │
+              Each chunk tagged with dataset_id
+              (complete dataset isolation)
 ```
 
 ### Data Flow: Query Phase
@@ -204,73 +213,83 @@ Graph RAG:
 
 ### 1. Ingestion Pipeline (`backend/ingestion.py`)
 
-**Step 1 — Document Loading**
+**Step 1 — Document Loading (Structure-Aware PDF Conversion)**
 ```python
-TextLoader(file_path)      # for .txt files
-PyPDFLoader(file_path)     # for .pdf files
+import pymupdf4llm
+md_text = pymupdf4llm.to_markdown(file_path)
 ```
-Produces a list of `langchain_core.documents.Document` objects with `.page_content` and `.metadata`.
+Unlike raw `PyPDFLoader` which strips all formatting, `pymupdf4llm` converts PDFs to structured Markdown — preserving section headers (`##`, `###`), tables, figure captions, and code blocks. This structural information is critical for the next step.
 
-**Step 2 — Chunking**
+**Step 2 — Two-Phase Chunking**
+
+*Phase 2a — Section-aware splitting:*
+```python
+MarkdownHeaderTextSplitter(
+    headers_to_split_on=[("##", "h2"), ("###", "h3")]
+)
+```
+Splits at section boundaries (`##` and `###` headers) instead of arbitrary character counts. Each chunk inherits its section header as metadata — so a chunk about "PagedAttention" knows it came from section "## Memory Management".
+
+*Phase 2b — Size guard for oversized sections:*
 ```python
 RecursiveCharacterTextSplitter(
-    chunk_size=1000,       # target ~1000 chars per chunk
-    chunk_overlap=200,     # 200-char overlap prevents context loss at boundaries
-    separators=["\n\n", "\n", ".", " "]  # prefer natural break points
+    chunk_size=1500,       # only splits sections exceeding 1500 chars
+    chunk_overlap=200,     # 200-char overlap at sub-section boundaries
 )
 ```
-Why overlap? Without it, a sentence that crosses a chunk boundary loses context. With 200-char overlap, both adjacent chunks contain that boundary content.
+Some sections are very long. This secondary splitter catches those, ensuring no chunk exceeds ~1500 characters while preserving natural break points.
 
-**Step 3 — Vector Index**
+**Why this is better than the old approach:** The old pipeline used `RecursiveCharacterTextSplitter(chunk_size=1000)` on raw text — it split mid-sentence, mid-table, and mid-code-block. Section-aware splitting keeps each chunk semantically coherent.
+
+**Step 3 — Vector Index + Full-Text Index (Hybrid Search)**
 ```python
-Neo4jVector.from_documents(
+neo4j_vector = Neo4jVector.from_documents(
     docs,
-    GoogleGenerativeAIEmbeddings(model="models/text-embedding-004"),
-    index_name="vector_index",
+    GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001"),
+    index_name=f"vector_index_{dataset_id}",   # isolated per dataset
     node_label="Chunk",
-    text_node_property="text",
-    embedding_node_property="embedding"
+    search_type="hybrid",
+    keyword_index_name=f"vector_index_{dataset_id}_ft",  # BM25 full-text index
 )
 ```
-Creates a `Chunk` node in Neo4j for each chunk. Each node has:
-- `text`: the raw chunk text
-- `embedding`: 768-dim float array from Google's text-embedding-004 model
-- `source`: the file path it came from
+Creates TWO indexes per dataset:
+- **`vector_index_{dataset_id}`** — HNSW vector index for semantic similarity search (768-dim embeddings)
+- **`vector_index_{dataset_id}_ft`** — BM25 full-text index for keyword matching
 
-A vector index is automatically created over the `embedding` property.
+At query time, both indexes are queried and results are merged via **Reciprocal Rank Fusion (RRF)** — combining the strengths of semantic search ("meaning") with keyword search ("exact terms"). Each chunk is tagged with `dataset_id` in its metadata, ensuring complete dataset isolation.
 
-**Step 4 — Graph Entity Extraction**
+**Step 4 — Graph Entity Extraction (Domain-Specific Schemas)**
 ```python
-llm = ChatGoogleGenerativeAI(temperature=0, model="gemini-2.5-pro")
-llm_transformer = LLMGraphTransformer(llm=llm)
-graph_documents = llm_transformer.convert_to_graph_documents(docs)
-graph.add_graph_documents(graph_documents, baseEntityLabel=True, include_source=True)
-```
-The `LLMGraphTransformer` sends each chunk to Gemini with a prompt asking it to extract:
-- **Nodes**: named entities like `Person`, `Organization`, `Product`, `Technology`, `Location`
-- **Relationships**: typed edges like `CEO_OF`, `CREATED`, `FOUNDED_BY`, `PART_OF`
+DOMAIN_SCHEMAS = {
+    "ml": {
+        "nodes": ["Concept", "Algorithm", "OptimizationTechnique", "ModelArchitecture",
+                  "SoftwareFramework", "Hardware", "PerformanceMetric", "Person", "Organization"],
+        "relationships": ["OPTIMIZES", "IMPLEMENTS", "SERVES", "USES", "PART_OF",
+                          "IMPROVES", "REQUIRES", "MEASURES", "RELATES_TO", "DEVELOPED_BY"]
+    },
+    "research": {
+        "nodes": ["Paper", "Author", "Method", "Dataset", "Result",
+                  "Hypothesis", "ResearchField", "Institution", "Concept"],
+        "relationships": ["AUTHORED_BY", "CITES", "PROPOSES", "USES_DATASET",
+                          "AFFILIATED_WITH", "IMPROVES_UPON", "COLLABORATED_WITH",
+                          "EVALUATES_ON", "RELATES_TO"]
+    },
+}
 
-These are written to Neo4j as actual graph nodes and labeled edges. Example result:
-```
-(Sam Altman:Person) -[:CEO_OF]-> (OpenAI:Organization)
-(OpenAI:Organization) -[:CREATED]-> (GPT-4:Product)
-(GPT-4:Product) -[:IS_A]-> (Large Language Model:Technology)
-```
-
-**Step 5 — Structural Linking**
-```cypher
-MATCH (c:Chunk) WHERE c.source = $source_file
-WITH c ORDER BY c.start_index ASC
-WITH collect(c) as chunk_list
-FOREACH (i in range(0, size(chunk_list)-2) |
-    FOREACH (c1 in [chunk_list[i]] |
-        FOREACH (c2 in [chunk_list[i+1]] |
-            MERGE (c1)-[:NEXT_CHUNK]->(c2)
-        )
-    )
+llm_transformer = LLMGraphTransformer(
+    llm=ChatGoogleGenerativeAI(temperature=0, model=GEMINI_MODEL),
+    allowed_nodes=schema["nodes"],
+    allowed_relationships=schema["relationships"],
 )
 ```
-Creates a linked list of chunks in document order. This enables sequential reading — if a retrieved chunk is the middle of a passage, the agent can traverse `NEXT_CHUNK` to get the surrounding context.
+Instead of letting the LLM extract arbitrary entity types, we constrain it with a domain schema. The "ml" schema (used for the book) extracts algorithms, architectures, and frameworks. The "research" schema (used for papers) extracts authors, methods, datasets, and institutions. Example result:
+```
+(PagedAttention:Algorithm) -[:OPTIMIZES]-> (KV Cache:Concept)
+(vLLM:SoftwareFramework) -[:IMPLEMENTS]-> (PagedAttention:Algorithm)
+(UC Berkeley:Organization) -[:DEVELOPED_BY]-> (vLLM:SoftwareFramework)
+```
+
+Entity extraction runs in batches of 20 with a 62-second sleep between batches (Gemini RPM rate limit). `LLMGraphTransformer` makes **2 LLM calls per chunk** (one for entities, one for relationships), so each batch consumes **40 requests**. For 369 chunks: 19 batches × 40 requests = **760 total requests**. At ~3-4 min processing + 62s sleep per batch ≈ **75-80 minutes** total.
 
 ---
 
@@ -284,9 +303,10 @@ class AgentState(TypedDict):
     web_search: str         # "Yes" / "No" — triggers query rewriting
     retry_count: int        # prevents infinite loops
     steps: List[str]        # audit log of each node visited
+    dataset_id: str         # which dataset to query (e.g. "book", "papers_energy_sustainability")
 ```
 
-The state is a plain Python TypedDict — LangGraph passes this dict between nodes, each node returns a partial update.
+The state is a plain Python TypedDict — LangGraph passes this dict between nodes, each node returns a partial update. The `dataset_id` field routes every retrieval call to the correct isolated vector index.
 
 ---
 
@@ -333,49 +353,65 @@ async for event in agent_app.astream_events(inputs, version="v1"):
         # Emit graph_update with entity graph + chunk overlay
         yield {"event": "graph_update", "data": json.dumps(graph_payload)}
 
-    elif event["event"] == "on_chain_start" and event["name"] in [...]:
-        # Emit current agent status
-        yield {"event": "status", "data": f"Agent is: {name}..."}
+    elif event["event"] == "on_chain_start" and event["name"] == "retrieve":
+        yield {"event": "status", "data": "stage:retrieve"}
+    elif event["event"] == "on_chain_start" and event["name"] == "grade_documents":
+        yield {"event": "status", "data": "stage:grade"}
+    elif event["event"] == "on_chain_start" and event["name"] == "transform_query":
+        yield {"event": "status", "data": "stage:rewrite"}
+    elif event["event"] == "on_chain_start" and event["name"] == "generate":
+        yield {"event": "status", "data": "stage:generate"}
 
     elif event["event"] == "on_chat_model_stream":
-        # Emit individual token
+        # Emit individual generation token
         yield {"event": "message", "data": token}
 ```
 
 Three SSE event types:
-- `graph_update`: fired once after retrieval, sends full entity graph as JSON
-- `status`: fired at each agent node transition, shows what step the agent is on
+- `graph_update`: fired once after retrieval, sends the full entity graph + retrieved chunk overlay as JSON
+- `status`: fired at each agent node transition. Uses `stage:` prefix (e.g. `stage:retrieve`, `stage:grade`) which the frontend parses to drive the pipeline visualizer
 - `message`: fired for every token from the generation LLM, streamed token-by-token
 
 ---
 
-### 5. Entity Graph Endpoint (`GET /graph`)
+### 5. Entity Graph Endpoint (`GET /graph?dataset_id=book`)
 
-Called by the frontend on page load. Queries Neo4j for all entity nodes and relationships, excluding raw `Chunk` and `Document` nodes:
+Called by the frontend on page load (and whenever the dataset selector changes). Queries Neo4j for entity nodes connected to Chunks belonging to the selected dataset — ensuring **complete dataset isolation**:
 
 ```cypher
-MATCH (n)
+MATCH (chunk:Chunk {dataset_id: $dataset_id})<-[:MENTIONS|PART_OF*0..2]-(n)
 WHERE NOT 'Chunk' IN labels(n) AND NOT 'Document' IN labels(n)
-WITH n LIMIT 120
+WITH DISTINCT n LIMIT 120
 OPTIONAL MATCH (n)-[r]->(m)
 WHERE NOT 'Chunk' IN labels(m) AND NOT 'Document' IN labels(m)
 RETURN
-    elementId(n) AS source_id,
-    n.name AS source_name,
-    labels(n) AS source_labels,
-    type(r) AS rel_type,
-    elementId(m) AS target_id,
-    m.name AS target_name,
-    labels(m) AS target_labels
+    elementId(n)                           AS source_id,
+    COALESCE(n.id, n.name, elementId(n))   AS source_name,
+    labels(n)                              AS source_labels,
+    type(r)                                AS rel_type,
+    elementId(m)                           AS target_id,
+    COALESCE(m.id, m.name, elementId(m))   AS target_name,
+    labels(m)                              AS target_labels
 ```
 
-Returns a `{nodes: [...], links: [...]}` JSON payload that `react-force-graph-2d` can directly render.
+**Key design decisions:**
+- Traverses from Chunk nodes (which carry `dataset_id`) outward to entities — so entities from dataset A never appear in dataset B's graph
+- `COALESCE(n.id, n.name, ...)` handles both `LLMGraphTransformer` property naming conventions
+- Falls back to an unfiltered query for legacy data without `dataset_id` tags
+
+### 5a. Datasets Endpoint (`GET /datasets`)
+
+Returns the list of available datasets by inspecting Neo4j indexes:
+```python
+graph.query("SHOW INDEXES YIELD name WHERE name STARTS WITH 'vector_index' RETURN name")
+```
+Filters out `_ft` (full-text) indexes and maps index names to dataset IDs. The frontend uses this to populate the dataset selector buttons.
 
 ---
 
 ### 6. Frontend Graph Visualization (`frontend/components/GraphViz.tsx`)
 
-Uses `react-force-graph-2d` — a React wrapper around D3's force simulation. Key decisions:
+Uses `react-force-graph-2d` — a React wrapper around D3's force simulation. Fully custom-rendered with glow effects, animated particles, and click-to-inspect nodes.
 
 **Why `dynamic import` with `ssr: false`?**
 `react-force-graph-2d` uses browser canvas APIs that don't exist in Node.js (Next.js server-side rendering). Dynamic import with `ssr: false` defers the import to the client bundle.
@@ -383,19 +419,38 @@ Uses `react-force-graph-2d` — a React wrapper around D3's force simulation. Ke
 **Why `useMemo`?**
 The force graph runs a physics simulation. Every time `graphData` changes by reference (not value), the simulation restarts from scratch — the graph "jumps". By memoizing with `useMemo`, the object reference only changes when the actual data changes, not on every SSE token.
 
-**Node coloring by type:**
-```
-Person       → blue   (#60a5fa)
-Organization → orange (#fb923c)
-Product      → purple (#c084fc)
-Technology   → green  (#34d399)
-Location     → amber  (#fbbf24)
-Query        → white  (#ffffff)
-Chunk        → gray   (#94a3b8)
+**Degree-based node sizing:**
+```typescript
+const nodeDegree: Record<string, number> = {};
+data.links.forEach(l => {
+    nodeDegree[l.source] = (nodeDegree[l.source] || 0) + 1;
+    nodeDegree[l.target] = (nodeDegree[l.target] || 0) + 1;
+});
+// Node size = 1 + min(degree * 0.5, 5) — hub nodes are visibly larger
 ```
 
-**Custom canvas rendering (`nodeCanvasObject`):**
-Rather than using the built-in node renderer, a custom canvas drawing function draws circles with text labels below them. This gives full control over appearance while staying at 60fps.
+**Node coloring by type (expanded for research entities):**
+```
+Algorithm        → cyan       (#22d3ee)     Author       → rose      (#fb7185)
+ModelArchitecture→ violet     (#a78bfa)     Institution  → teal      (#2dd4bf)
+SoftwareFramework→ amber      (#fbbf24)     Method       → sky       (#38bdf8)
+Concept          → emerald    (#34d399)     Paper        → indigo    (#818cf8)
+Person           → blue       (#60a5fa)     ResearchField→ lime      (#a3e635)
+Organization     → orange     (#fb923c)     Query        → white     (#ffffff)
+Hardware         → red        (#f87171)     Chunk        → slate     (#94a3b8)
+```
+
+**Glow effects via `ctx.shadowBlur`:**
+Each node type has a matching glow color. Highlighted nodes (retrieved chunks) get an extra outer ring. The `shadowBlur` API creates a soft halo around each circle.
+
+**Animated edge particles:**
+`linkDirectionalParticles={3}` with `linkDirectionalParticleSpeed={0.004}` draws small dots flowing along relationship edges, making the graph feel alive.
+
+**Click-to-inspect detail panel:**
+Clicking a node opens a side panel showing: type badge, entity name, connection count (degree), and a list of all relationships with direction arrows (→ / ←).
+
+**`highlightNodeIds` prop:**
+When the agent retrieves chunks, their node IDs are passed down as a `Set<string>`. Highlighted nodes get full opacity and a colored outer ring; non-highlighted nodes are dimmed to `rgba(71,85,105,0.65)`.
 
 ---
 
@@ -412,8 +467,9 @@ Rather than using the built-in node renderer, a custom canvas drawing function d
 | **LangChain Experimental** | 0.0.64 | Contains `LLMGraphTransformer` which is still experimental/unstable | Entity extraction from document chunks into Neo4j graph format |
 | **LangChain Google GenAI** | 1.0.10 | Google Gemini API integration for LangChain | `ChatGoogleGenerativeAI` for the LLM, `GoogleGenerativeAIEmbeddings` for embeddings |
 | **Google Gemini 2.5 Pro** | API | Generation model — full reasoning for final answer synthesis, entity extraction, and query rewriting. Note: model ID is `gemini-2.5-pro` (the `-preview` suffix was retired by Google) | Final answer generation, entity extraction from document chunks |
-| **Google Gemini 2.0 Flash** | API | Grading model — fast binary relevance judgement (yes/no). ~10× faster than Pro for the same simple task. All 6 chunk grades fire in parallel via `asyncio.gather()` | Document relevance grading in the `grade_documents` node |
-| **Google gemini-embedding-001** | API | Embedding model (768 dims). Separate from generation models — outputs a fixed-size vector, not text | Converts text chunks and queries to vectors for semantic search |
+| **Google Gemini 2.5 Flash Lite** | API | Grading model — fast binary relevance judgement (yes/no). ~10× faster than Pro for the same simple task. All chunk grades fire in parallel via `asyncio.gather()`. Note: `gemini-2.0-flash` was deprecated; `gemini-2.5-flash-lite` is the current replacement | Document relevance grading in the `grade_documents` node |
+| **Google gemini-embedding-001** | API | Embedding model. Separate from generation models — outputs a fixed-size vector, not text | Converts text chunks and queries to vectors for semantic search |
+| **pymupdf4llm** | 0.0.17+ | Structure-aware PDF→Markdown converter. Preserves headers, tables, figure captions, code blocks | Replaces raw `PyPDFLoader` — each chunk retains its section context |
 | **Neo4j** | **5.26.0** | Graph database that natively supports both vector indexes and labeled property graphs. **Pinned to 5.26.0** — newer versions changed `CALL {} IN TRANSACTIONS` behaviour which broke LangChain's `add_graph_documents()` | Stores `Chunk` nodes (vector search) + entity nodes/edges (knowledge graph) |
 | **SSE-Starlette** | 2.0.0 | Server-Sent Events for FastAPI. Chosen over WebSockets because SSE is unidirectional, simpler, works over HTTP/2, no client library needed | Streams graph updates, status events, and LLM tokens to the browser |
 | **Pydantic** | 2.6.3 | Data validation and schema definition | `GradeDocuments` schema for structured LLM output in the grader node |
@@ -435,7 +491,7 @@ Rather than using the built-in node renderer, a custom canvas drawing function d
 | Technology | Version | Why It's Used | How It's Used |
 |---|---|---|---|
 | **Docker Compose** | 3.8 | Orchestrates multi-container setup. Single command to start Neo4j + Backend + Frontend | `docker-compose up -d` starts all three services |
-| **Neo4j 5.18** | Docker image | Graph database with APOC and Graph Data Science plugins | Persists knowledge graph to `./neo4j_data` volume |
+| **Neo4j 5.26.0** | Docker image | Graph database with APOC and Graph Data Science plugins | Persists knowledge graph to `./neo4j_data` volume |
 | **Python 3.11** | Base image | Async support, performance, LangChain compatibility | Backend runtime |
 | **Node 20** | Base image | LTS version with latest V8 engine | Frontend runtime |
 
@@ -449,19 +505,32 @@ EnterpriseBrain/
 ├── backend/
 │   ├── agent/
 │   │   ├── __init__.py
-│   │   ├── state.py          # AgentState TypedDict — shared state schema
+│   │   ├── state.py          # AgentState TypedDict — includes dataset_id field
 │   │   ├── nodes.py          # 4 agent functions: retrieve, grade, transform, generate
+│   │   │                       # Dynamic retriever cache per dataset_id
+│   │   │                       # Hybrid search (vector + BM25) with fallback
 │   │   └── graph.py          # LangGraph state machine definition
 │   │
 │   ├── data/
-│   │   ├── sample_financial_report.txt   # TechFin Corp Q3 2025 (demo)
-│   │   └── *.txt                         # Wikipedia articles (after fetch_data.py)
+│   │   ├── Hands-On LLM Serving and Optimization.pdf   # ML book (dataset: book)
+│   │   ├── *.pdf                                       # Research papers (4 datasets)
+│   │   └── Patent1.pdf                                  # VR Overlay patent
 │   │
-│   ├── main.py               # FastAPI app: /stream and /graph endpoints
+│   ├── main.py               # FastAPI: /stream, /graph, /datasets endpoints
+│   │                           # Pipeline stage events (stage:retrieve, stage:grade, etc.)
+│   │                           # Dataset-filtered Cypher queries with COALESCE
 │   ├── ingestion.py          # Document → Neo4j pipeline
-│   ├── fetch_data.py         # Wikipedia data fetcher + ingestion runner
-│   ├── requirements.txt      # Python dependencies
-│   ├── .env                  # Environment variables (API keys, Neo4j URI)
+│   │                           # pymupdf4llm + MarkdownHeaderTextSplitter
+│   │                           # Hybrid search indexes (vector + BM25)
+│   │                           # Domain-specific entity schemas (ml, research)
+│   ├── ingest_all.py         # Master ingestion script with MANIFEST dict
+│   │                           # Maps all 19 PDFs to 4 datasets with domain schemas
+│   │                           # CLI: --list, --dataset <name>, or no args = all
+│   ├── extract_entities.py   # Entity extraction only (no re-embedding)
+│   │                           # Reads existing Chunks, runs LLMGraphTransformer
+│   ├── fetch_data.py         # Wikipedia data fetcher (legacy demo)
+│   ├── requirements.txt      # Python dependencies (pymupdf4llm, nest_asyncio, etc.)
+│   ├── .env                  # Environment variables (git-ignored)
 │   └── Dockerfile            # python:3.11-slim → uvicorn main:app
 │
 ├── frontend/
@@ -471,8 +540,11 @@ EnterpriseBrain/
 │   │   └── globals.css       # Tailwind directives + CSS variables
 │   │
 │   ├── components/
-│   │   ├── ChatInterface.tsx  # SSE client, messages state, query input
-│   │   └── GraphViz.tsx       # react-force-graph-2d wrapper, node coloring
+│   │   ├── ChatInterface.tsx  # SSE client, dataset selector, pipeline visualizer
+│   │   │                       # Tracks active pipeline stage (retrieve/grade/rewrite/generate)
+│   │   │                       # Passes highlightNodeIds to GraphViz for retrieved chunks
+│   │   └── GraphViz.tsx       # Force-directed graph with glow, particles, click-to-inspect
+│   │                           # Degree-based sizing, expanded color palette, detail panel
 │   │
 │   ├── package.json
 │   ├── tsconfig.json
@@ -480,9 +552,9 @@ EnterpriseBrain/
 │   └── Dockerfile            # node:20-alpine → npm run dev
 │
 ├── neo4j_data/               # Neo4j persistent data volume (git-ignored)
-├── neo4j_plugins/            # APOC + GDS plugins
+├── neo4j_plugins/            # APOC + GDS plugins (git-ignored)
 ├── docker-compose.yml        # Orchestrates all 3 services
-└── .env                      # Docker Compose env vars (GOOGLE_API_KEY etc.)
+└── .env                      # Docker Compose env vars (git-ignored)
 ```
 
 ---
@@ -566,51 +638,50 @@ npm run dev
 
 ## Ingesting Data
 
-The graph is empty until you ingest documents. Run ingestion from inside the backend container (or locally if running without Docker).
+The graph is empty until you ingest documents. The project uses a manifest-based ingestion system with 4 isolated datasets.
 
-### Via Docker (Recommended)
+### Available Datasets
+
+| Dataset ID | Files | Domain | Description |
+|---|---|---|---|
+| `book` | Hands-On LLM Serving and Optimization.pdf | ml | ML textbook — algorithms, architectures, frameworks |
+| `papers_energy_sustainability` | 5 PDFs | research | Energy feedback, carbon footprint, WattDepot |
+| `papers_serious_games` | 6 PDFs | research | Kukui Cup, Makahiki, serious games for energy |
+| `papers_hci_ubicomp` | 7 PDFs + 1 patent | research | HCI, ubicomp, CSCW, VR overlay |
+
+### Ingest a Single Dataset (Recommended)
 
 ```bash
-# Fetch 9 Wikipedia articles + ingest all of them into Neo4j
-docker exec -it graphrag-backend python fetch_data.py
+# Ingest the book dataset (embeddings + entity extraction, ~20 min)
+docker exec -it graphrag-backend python ingest_all.py --dataset book
 
-# OR: just download without ingesting (saves to backend/data/)
-docker exec -it graphrag-backend python fetch_data.py --fetch-only
+# List all datasets and their files
+docker exec -it graphrag-backend python ingest_all.py --list
 
-# OR: ingest files already in data/ without re-downloading
-docker exec -it graphrag-backend python fetch_data.py --ingest-only
+# Ingest all datasets (run one at a time to respect rate limits)
+docker exec -it graphrag-backend python ingest_all.py --dataset papers_energy_sustainability
+docker exec -it graphrag-backend python ingest_all.py --dataset papers_serious_games
+docker exec -it graphrag-backend python ingest_all.py --dataset papers_hci_ubicomp
 ```
 
-**What gets ingested:**
-| Article | Rich entities for |
-|---|---|
-| OpenAI | Sam Altman, ChatGPT, GPT-4, Microsoft investment |
-| Anthropic | Dario Amodei, Claude, Constitutional AI |
-| Google DeepMind | Demis Hassabis, AlphaFold, AlphaGo, Gemini |
-| NVIDIA | Jensen Huang, CUDA, H100, GPU architecture |
-| Large language model | Transformer, BERT, GPT, attention mechanism |
-| Transformer architecture | Attention, encoder/decoder, Google Brain |
-| Sam Altman | Y Combinator, OpenAI CEO career |
-| Demis Hassabis | DeepMind founding, neuroscience background |
-| Retrieval-augmented generation | RAG components, vector databases, applications |
+### Entity Extraction Only (if embeddings already exist)
 
-### Via Local Python
-
+If you've already ingested embeddings but need to re-extract the knowledge graph:
 ```bash
-cd backend
-python fetch_data.py
+docker exec -it graphrag-backend python extract_entities.py --dataset book
 ```
+This reads existing Chunk nodes from Neo4j and runs `LLMGraphTransformer` without re-embedding.
 
-### Ingest Your Own Documents
+### Ingest a Custom Document
 
 ```bash
-# Copy your PDF/TXT to the data directory
+# Copy your PDF to the data directory
 cp my_document.pdf backend/data/
 
-# Run ingestion on that specific file
+# Run ingestion with a custom dataset_id and domain
 docker exec -it graphrag-backend python -c "
 from ingestion import ingest_document
-ingest_document('data/my_document.pdf')
+ingest_document('data/my_document.pdf', dataset_id='my_dataset', domain='auto')
 "
 ```
 
@@ -619,59 +690,77 @@ ingest_document('data/my_document.pdf')
 Open `http://localhost:7474` (login: neo4j / password123) and run:
 
 ```cypher
+// Count chunks per dataset
+MATCH (c:Chunk) RETURN c.dataset_id AS dataset, count(c) AS chunks ORDER BY chunks DESC
+
 // See all entity types ingested
-MATCH (n) RETURN labels(n), count(*) ORDER BY count(*) DESC
+MATCH (n:__Entity__) RETURN labels(n), count(*) ORDER BY count(*) DESC
 
 // See all relationships
 MATCH (a)-[r]->(b) RETURN type(r), count(*) ORDER BY count(*) DESC
 
-// Browse Person → Organization relationships
-MATCH (p:Person)-[r]->(o:Organization) RETURN p, r, o LIMIT 25
+// List all vector indexes (one per dataset)
+SHOW INDEXES YIELD name WHERE name STARTS WITH 'vector_index' RETURN name
+
+// Browse entities for a specific dataset
+MATCH (chunk:Chunk {dataset_id: "book"})<-[:MENTIONS|PART_OF*0..2]-(n:__Entity__)
+RETURN DISTINCT n.id AS entity, labels(n) AS type LIMIT 50
 ```
 
 ---
 
 ## API Reference
 
-### `GET /stream?query=<string>`
+### `GET /stream?query=<string>&dataset_id=<string>`
 
-Opens a Server-Sent Events stream. Returns three event types:
+Opens a Server-Sent Events stream. The `dataset_id` parameter routes the query to the correct isolated vector index.
 
 ```
 event: status
-data: Agent is currently: grade_documents...
+data: stage:retrieve
 
 event: graph_update
-data: {"nodes":[{"id":"abc","label":"Sam Altman","type":"Person","val":1},...], "links":[...]}
+data: {"nodes":[{"id":"abc","label":"PagedAttention","type":"Algorithm","val":1},...], "links":[...]}
+
+event: status
+data: stage:grade
+
+event: status
+data: stage:generate
 
 event: message
-data: Sam Altman is the CEO of OpenAI.
+data: PagedAttention optimizes GPU memory by...
 
 event: message
-data:  He previously served as president of Y Combinator.
+data:  partitioning the KV cache into non-contiguous blocks.
 ```
 
-- `status` events fire at each agent node transition
-- `graph_update` fires once after retrieval, contains the full entity graph + retrieved chunk overlay
+- `status` events with `stage:` prefix fire at each agent node transition — the frontend parses these to animate the pipeline visualizer
+- `graph_update` fires once after retrieval, contains the entity graph for this dataset + a query node + retrieved chunk overlay nodes
 - `message` events fire one token at a time until the answer is complete
 
-### `GET /graph`
+### `GET /graph?dataset_id=<string>`
 
-Returns the full knowledge graph (no query needed). Called by the frontend on page load.
+Returns the knowledge graph for a specific dataset. Called by the frontend on page load and when the dataset selector changes.
 
 ```json
 {
   "nodes": [
-    {"id": "4:abc123", "label": "Sam Altman", "type": "Person", "val": 1},
-    {"id": "4:def456", "label": "OpenAI", "type": "Organization", "val": 1}
+    {"id": "4:abc123", "label": "PagedAttention", "type": "Algorithm", "val": 1},
+    {"id": "4:def456", "label": "vLLM", "type": "SoftwareFramework", "val": 1}
   ],
   "links": [
-    {"source": "4:abc123", "target": "4:def456", "label": "CEO_OF"}
+    {"source": "4:def456", "target": "4:abc123", "label": "IMPLEMENTS"}
   ]
 }
 ```
 
-Returns `{"nodes": [], "links": [], "error": "..."}` if Neo4j is not reachable.
+### `GET /datasets`
+
+Returns available dataset IDs by inspecting Neo4j vector indexes:
+```json
+{"datasets": ["book", "papers_energy_sustainability", "papers_serious_games", "papers_hci_ubicomp"]}
+```
 
 ---
 
@@ -680,35 +769,41 @@ Returns `{"nodes": [], "links": [], "error": "..."}` if Neo4j is not reachable.
 ### What you see
 
 ```
-┌─────────────────────────────────┬────────────────────────────────────────┐
-│  EnterpriseBrain        3n · 5e │                                        │
-│  ┌───────────────────────────┐  │                                        │
-│  │ [user message]            │  │   LIVE KNOWLEDGE GRAPH                 │
-│  │ [assistant response]      │  │                                        │
-│  │ ...                       │  │   ● Person  ● Organization ● Product   │
-│  └───────────────────────────┘  │   ● Technology  ● Location             │
-│                                 │                                        │
-│  STATUS: Agent is: generate...  │     (force-directed graph canvas)      │
-│  ┌───────────────────────┐ Ask  │                                        │
-│  │ Ask the knowledge...  │      │                                        │
-└─────────────────────────────────┴────────────────────────────────────────┘
+┌──────────────────────────────────────┬────────────────────────────────────────────┐
+│  ● EnterpriseBrain          120n·85e │  Live Knowledge Graph [book]               │
+│  Dataset: [book] [energy] [games]    │  ↳ 10 chunks retrieved                     │
+│                                      │                                            │
+│  Pipeline                            │                                            │
+│  [✓ Retrieve]→[● Grade]→[Rewrite]→   │     (force-directed graph canvas           │
+│   [Generate]                         │      with glow, particles, detail panel)   │
+│                                      │                                            │
+│  ┌────────────────────────────────┐  │  ● Algorithm  ● ModelArchitecture          │
+│  │ [user] What is PagedAttention? │  │  ● SoftwareFramework  ● Concept            │
+│  │ [bot]  PagedAttention is a...  │  │  ● Person  ● Organization  ● Query         │
+│  └────────────────────────────────┘  │                                            │
+│                                      │                                            │
+│  Running: grade...                   │                                            │
+│  ┌────────────────────────────┐ Ask  │                                            │
+│  │ Ask about [book]...        │      │                                            │
+└──────────────────────────────────────┴────────────────────────────────────────────┘
 ```
 
-- **Top-right header** (`3n · 5e`): current node and edge count in the graph
-- **Status bar**: shows the current agent step in real time
-- **Graph canvas**: force-directed layout, drag nodes, scroll to zoom, hover for tooltip
-- **Node colors**: each entity type has a distinct color (see legend below graph)
-- **Arrows**: directional, show relationship direction (e.g., Person → CEO_OF → Organization)
-- **Enter key**: submits the query
+- **Dataset selector**: Color-coded buttons for each ingested dataset. Switching datasets reloads the graph and routes all queries to that dataset's isolated index
+- **Pipeline visualizer**: `Retrieve → Grade → Rewrite → Generate` — active stage glows blue with a spinning indicator, completed stages show ✓, Rewrite only lights up if retrieval fails
+- **Node counter** (`120n · 85e`): live count of entity nodes and relationship edges
+- **Graph canvas**: force-directed layout with glow effects, animated edge particles, click any node to open the detail panel
+- **Chunk highlight counter**: `↳ 10 chunks retrieved` pulses blue when the agent retrieves documents
+- **Node detail panel**: click a node → see its type badge, name, connection count, and all relationships with direction arrows
+- **Dataset color badges**: each message shows which dataset it was answered from
 
-### Example Questions (after ingesting Wikipedia articles)
+### Example Questions (after ingesting the ML book)
 
 ```
-"Who founded OpenAI and what is their relationship to Anthropic?"
-"What is the connection between Sam Altman and Y Combinator?"
-"What products has Google DeepMind created?"
-"How does retrieval-augmented generation work?"
-"What is NVIDIA's role in AI development?"
+"What is PagedAttention and how does it improve GPU memory efficiency?"
+"How does vLLM differ from HuggingFace inference?"
+"What is continuous batching and why does it matter?"
+"Explain the KV cache problem in LLM serving"
+"What are the tradeoffs between model parallelism and tensor parallelism?"
 ```
 
 ---
@@ -771,9 +866,9 @@ original_question = "Who is the CEO of OpenAI?"
 ### `backend/.env` (local development)
 ```env
 GOOGLE_API_KEY=your_key_here
-GEMINI_MODEL=gemini-2.5-pro           # generation model — full reasoning
-GEMINI_GRADING_MODEL=gemini-2.0-flash # grading model — fast binary yes/no
-NEO4J_URI=bolt://localhost:7687       # localhost for local dev
+GEMINI_MODEL=gemini-2.5-pro               # generation + entity extraction model
+GEMINI_GRADING_MODEL=gemini-2.5-flash-lite # grading model — fast binary yes/no
+NEO4J_URI=bolt://localhost:7687           # localhost for local dev
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=password123
 ```
@@ -782,21 +877,24 @@ NEO4J_PASSWORD=password123
 ```env
 GOOGLE_API_KEY=your_key_here
 GEMINI_MODEL=gemini-2.5-pro
-NEO4J_URI=bolt://neo4j:7687           # neo4j = Docker service name
+GEMINI_GRADING_MODEL=gemini-2.5-flash-lite
+NEO4J_URI=bolt://neo4j:7687               # neo4j = Docker service name
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=password123
 ```
 
 ### Model Configuration
 
-Two separate models serve two different jobs (`backend/agent/nodes.py`):
+Three separate models serve three different jobs:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GEMINI_MODEL` | `gemini-2.5-pro` | Final answer generation — needs full reasoning |
-| `GEMINI_GRADING_MODEL` | `gemini-2.0-flash` | Relevance grading — binary yes/no, Flash is 10× faster |
+| `GEMINI_MODEL` | `gemini-3.1-pro-preview` | Final answer generation (`nodes.py`) and entity extraction (`extract_entities.py`) |
+| `GEMINI_ENTITY_MODEL` | `gemini-3.1-pro-preview` | Entity extraction during ingestion (`ingestion.py`) — decoupled from generation model |
+| `GEMINI_GRADING_MODEL` | `gemini-2.5-flash-lite` | Relevance grading — binary yes/no, ~10× faster than Pro |
+| Embedding model | `gemini-embedding-001` | Fixed in code — outputs vectors for semantic search |
 
-To change either model, update the corresponding `.env` variable. No code changes needed.
+**Note:** `gemini-2.0-flash` was deprecated for new API keys (404 errors). The replacement `gemini-2.5-flash-lite` provides equivalent grading performance. To change models, update the `.env` variable — no code changes needed.
 
 ### Neo4j Memory Tuning
 
@@ -813,42 +911,74 @@ Increase `max__size` to `4G` if you ingest many large documents and queries slow
 
 ### Response Latency — Before and After
 
-| Step | Old behaviour | New behaviour |
+| Step | Old behaviour | Current behaviour |
 |---|---|---|
-| Chunks retrieved | k=12 (12 grading calls) | k=6 (6 grading calls) |
+| Chunks retrieved | k=12 (12 grading calls) | k=10 with hybrid search (vector + BM25) |
 | Grading execution | Sequential — one call at a time | Parallel — all fire with `asyncio.gather()` |
-| Grading model | Gemini 2.5 Pro (~8s/call) | Gemini 2.0 Flash (~2s/call) |
+| Grading model | Gemini 2.5 Pro (~8s/call) | Gemini 2.5 Flash Lite (~2s/call) |
 | **Grading total** | **~96s** | **~3-5s** |
+| HNSW ef_search | 100 (default) | 300 (tripled for better recall) |
+| Chunking | RecursiveCharacterTextSplitter 1000 | pymupdf4llm + MarkdownHeaderTextSplitter 1500 |
+| Search type | Vector only | **Hybrid (vector + BM25 via RRF)** |
 | Generation | Gemini 2.5 Pro, streaming | Gemini 2.5 Pro, streaming (unchanged) |
 | **End-to-end** | **~2-3 minutes** | **~20-25 seconds** |
 
-### Why Two Models?
+### Why Hybrid Search (Vector + BM25)?
+
+Vector search finds semantically similar content but can miss exact technical terms. BM25 keyword search finds exact matches but misses paraphrases. Combining them via **Reciprocal Rank Fusion** gets the best of both:
+
+```
+Query: "What is PagedAttention?"
+
+Vector search (semantic):      BM25 search (keyword):
+  1. chunk about KV cache       1. chunk containing "PagedAttention" literally
+  2. chunk about memory mgmt    2. chunk mentioning "paged attention"
+  3. chunk about vLLM internals  3. chunk about vLLM + PagedAttention
+
+RRF merges both ranked lists → top-K has both semantic + keyword relevance
+```
+
+### Why Three Models?
 
 Embedding models, grading models, and generation models are fundamentally different:
 
 ```
-gemini-embedding-001   → Input: text → Output: [768 floats]  (fixed size)
-                          Purpose: convert text to a comparable vector
-                          Speed: ~5ms, very cheap
+text-embedding-004        → Input: text → Output: [768 floats]  (fixed size)
+                             Purpose: convert text to a comparable vector
+                             Speed: ~5ms, very cheap
 
-gemini-2.0-flash       → Input: text → Output: "yes" or "no"
-                          Purpose: fast binary relevance judgement
-                          Speed: ~2s, cheap — used for grading only
+gemini-2.5-flash-lite     → Input: text → Output: "yes" or "no"
+                             Purpose: fast binary relevance judgement
+                             Speed: ~2s, cheap — used for grading only
 
-gemini-2.5-pro         → Input: text → Output: full reasoning paragraph
-                          Purpose: synthesise answer from retrieved context
-                          Speed: ~10-20s, expensive — used once per query
+gemini-2.5-pro            → Input: text → Output: full reasoning paragraph
+                             Purpose: synthesise answer from retrieved context
+                             Speed: ~10-20s, expensive — used once per query
 ```
 
 You **cannot** use a generation model for embeddings (its output is variable-length text, not a fixed vector) and you **should not** use the most powerful model for simple yes/no decisions that a faster model handles just as well.
 
+### HNSW ef_search Tuning
+
+HNSW (Hierarchical Navigable Small World) is an approximate nearest-neighbor algorithm. `ef_search` controls how many nodes the algorithm visits before stopping — higher values mean better recall but slower search:
+
+| ef_search | Recall | Latency | Our choice |
+|---|---|---|---|
+| 100 (default) | ~92% | ~5ms | ✗ Misses some relevant chunks |
+| **300 (current)** | **~97%** | **~12ms** | **✓ Good balance for RAG** |
+| 500 | ~99% | ~25ms | ✗ Diminishing returns |
+
+We tripled `ef_search` from 100 to 300 because in RAG, missing a relevant chunk is much worse than a few extra milliseconds of search time.
+
 ### Scaling Considerations
 
 At enterprise scale (1000+ documents, 100k+ pages):
-- **Vector search stays fast**: HNSW index is O(log N) — 500k chunks still searches in ~200ms
+- **Vector search stays fast**: HNSW index is O(log N) — 500k chunks still searches in ~12ms with ef_search=300
 - **Grading stays fast**: parallel async calls mean latency = slowest single call, regardless of k
+- **Hybrid search scales independently**: BM25 index is separate from vector — both query in parallel
+- **Dataset isolation scales**: each dataset gets its own index pair — no cross-contamination at any scale
 - **Bottleneck shifts to**: Neo4j cluster replication, Gemini Pro API rate limits, ingestion throughput
-- **Next steps**: Redis semantic cache (cache identical/near-identical queries), hybrid BM25+vector search, SageMaker deployment for production
+- **Next steps**: Redis semantic cache, parent-child chunking (broader context with precise retrieval), SageMaker deployment for production
 
 ---
 
